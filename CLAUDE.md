@@ -2,20 +2,64 @@
 
 This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
 
+## Development Commands
+
+### Local setup
+
+```bash
+# Install deps (requires Python 3.12+)
+uv pip install -e ".[dev]"
+
+# Copy and fill in env vars
+cp .env.example .env
+
+# Start Supabase local stack (requires Supabase CLI)
+supabase start                  # prints SUPABASE_URL, SERVICE_ROLE_KEY, DATABASE_URL
+supabase db reset               # apply all migrations from supabase/migrations/
+
+# Start supporting services (Redis, LiteLLM, Langfuse)
+docker compose up redis litellm langfuse langfuse-db -d
+```
+
+### Run services locally (without Docker)
+
+```bash
+uvicorn src.ingress.app:app --reload   # ingress on :8000
+python -m src.worker.main              # queue worker
+```
+
+### Tests, lint, types
+
+```bash
+pytest                                 # all tests
+pytest tests/ingress/                  # single module
+ruff check .                           # lint
+mypy src                               # type check
+```
+
+### Database migrations
+
+```bash
+supabase migration new <name>          # creates supabase/migrations/<timestamp>_<name>.sql
+supabase db reset                      # wipe local DB and re-run all migrations
+```
+
+---
+
 ## Project Overview
 
-This is a **pre-implementation** repository for an AI-powered task management layer on top of Todoist. The primary user interface is Todoist's own comment threads — no separate UI is needed. The system receives Todoist webhooks, processes them through a pipeline of specialised agents, and writes back to Todoist (comments, field updates) while keeping the user in control via a human-in-the-loop (HITL) gate.
+This is an AI-powered task management layer on top of Todoist. The primary user interface is Todoist's own comment threads — no separate UI is needed. The system receives Todoist webhooks, processes them through a pipeline of specialised agents, and writes back to Todoist (comments, field updates) while keeping the user in control via a human-in-the-loop (HITL) gate.
 
-## Planned Tech Stack
+## Tech Stack
 
-- **Runtime**: Python (FastAPI for ingress, async workers)
-- **Queue**: Managed pub/sub or SQS/SNS
-- **DB**: Postgres with pgvector (single DB for both relational data and embeddings)
-- **Cache**: Redis (idempotency, rate limits, short-term locks)
-- **Orchestration**: LangGraph or Burr (stateful agent graph with checkpointing + interrupts)
-- **LLM gateway**: LiteLLM or Portkey (routing, retries, cost tracking)
-- **Observability**: Langfuse (LLM traces + evals), OpenTelemetry → Grafana/Datadog
-- **Hosting**: Containerised on Cloud Run / Fargate; one ingress service, one worker service, one scheduler
+- **Runtime**: Python 3.12, FastAPI (ingress), asyncpg (DB), async worker loop
+- **Queue**: pgmq (Postgres-native, built into Supabase) — no separate queue service needed
+- **DB**: Supabase (Postgres 15 + pgvector + pgmq). Local dev via `supabase start`.
+- **Cache**: Redis — idempotency keys, rate limits, short-term locks
+- **Orchestration**: LangGraph — stateful agent graph with checkpointing + HITL interrupts
+- **LLM gateway**: LiteLLM (self-hosted via Docker) — model routing, retries, cost tracking
+- **Observability**: Langfuse (self-hosted via Docker) — LLM traces and evals
+- **Services**: ingress container, worker container, scheduler (APScheduler inside worker)
 
 ## End-to-End Flow
 
@@ -30,6 +74,34 @@ Todoist webhook → Ingress API → Event queue → Worker → Orchestrator → 
 - **No deletes, no auto-complete**: The system never deletes tasks and never completes tasks unless the user explicitly says so.
 - **Idempotency everywhere**: Short-TTL idempotency cache keyed on event ID prevents double-processing; action dedupe prevents the same mutation running twice within N minutes.
 - **Single open question rule**: `ai_questions` table enforces one unanswered question per task at a time — the system will not re-ask a question already open.
+
+## Code Structure
+
+```
+src/
+  ingress/     FastAPI app — webhook signature verification, Redis idempotency, pgmq enqueue
+  worker/      Poll loop — reads pgmq, dispatches to orchestrator (LangGraph)
+  agents/      LangGraph graph definitions, one file per agent
+  skills/      Stateless async functions: each takes context, returns a typed Pydantic model
+  tools/       Side-effecting integrations (Todoist API, vector store, audit log, etc.)
+  state/       asyncpg pool (db.py), task state machine helpers
+  scheduler/   APScheduler jobs (hourly scan, daily review, nightly learning pass)
+  config.py    Single pydantic-settings Settings instance, imported as `from src.config import settings`
+
+supabase/
+  config.toml                        Supabase CLI local config
+  migrations/                        SQL migration files — one file per schema change
+
+tests/
+  conftest.py                        Sets required env vars before any src import
+  ingress/test_webhook.py            Unit tests for signature, idempotency, enqueue path
+```
+
+Key cross-cutting conventions:
+- DB access goes through the `asyncpg.Pool` from `src.state.db.get_pool()` — never create ad-hoc connections.
+- All LLM calls route through LiteLLM at `settings.litellm_base_url` using model aliases defined in `litellm_config.yaml` (e.g. `"claude-sonnet"`, not a raw model string).
+- Every Todoist mutation must pass through the Validator before being applied. The Validator returns `{approve | suggest | reject, reason, confidence}`. "suggest" outcomes are posted as task comments, not applied directly.
+- Skills must be pure functions (no side effects, no DB, no HTTP). Tools own all side effects.
 
 ## Agents
 
