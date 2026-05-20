@@ -10,6 +10,7 @@ from fastapi.testclient import TestClient
 from src.ingress.app import app
 
 SECRET = "test-secret"
+DELIVERY_ID = "delivery-abc-123"
 
 
 def sign(body: bytes) -> str:
@@ -48,6 +49,25 @@ def test_invalid_signature(client):
     assert resp.status_code == 401
 
 
+def test_delivery_id_used_for_dedup(client):
+    payload = {"event_name": "item:added", "event_data": {"id": "123"}}
+    body = json.dumps(payload).encode()
+
+    with (
+        patch("src.ingress.app.is_duplicate", new_callable=AsyncMock, return_value=False) as mock_dedup,
+        patch("src.ingress.app.enqueue", new_callable=AsyncMock),
+    ):
+        client.post(
+            "/webhook/todoist",
+            content=body,
+            headers={
+                "X-Todoist-Hmac-SHA256": sign(body),
+                "X-Todoist-Delivery-ID": DELIVERY_ID,
+            },
+        )
+        mock_dedup.assert_called_once_with(DELIVERY_ID)
+
+
 def test_duplicate_skipped(client):
     payload = {"event_name": "item:added", "event_data": {"id": "123"}}
     body = json.dumps(payload).encode()
@@ -59,7 +79,10 @@ def test_duplicate_skipped(client):
         resp = client.post(
             "/webhook/todoist",
             content=body,
-            headers={"X-Todoist-Hmac-SHA256": sign(body)},
+            headers={
+                "X-Todoist-Hmac-SHA256": sign(body),
+                "X-Todoist-Delivery-ID": DELIVERY_ID,
+            },
         )
     assert resp.status_code == 200
     mock_enqueue.assert_not_called()
@@ -76,7 +99,28 @@ def test_valid_event_enqueued(client):
         resp = client.post(
             "/webhook/todoist",
             content=body,
-            headers={"X-Todoist-Hmac-SHA256": sign(body)},
+            headers={
+                "X-Todoist-Hmac-SHA256": sign(body),
+                "X-Todoist-Delivery-ID": DELIVERY_ID,
+            },
         )
     assert resp.status_code == 200
     mock_enqueue.assert_called_once()
+
+
+def test_falls_back_to_content_hash_when_no_delivery_id(client):
+    """Without X-Todoist-Delivery-ID the body SHA-256 is used as the dedup key."""
+    payload = {"event_name": "item:updated", "event_data": {"id": "789"}}
+    body = json.dumps(payload).encode()
+
+    with (
+        patch("src.ingress.app.is_duplicate", new_callable=AsyncMock, return_value=False),
+        patch("src.ingress.app.enqueue", new_callable=AsyncMock),
+    ):
+        resp = client.post(
+            "/webhook/todoist",
+            content=body,
+            headers={"X-Todoist-Hmac-SHA256": sign(body)},
+            # intentionally no X-Todoist-Delivery-ID
+        )
+    assert resp.status_code == 200

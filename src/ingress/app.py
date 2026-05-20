@@ -1,4 +1,3 @@
-import hashlib
 import json
 import logging
 from contextlib import asynccontextmanager
@@ -26,17 +25,12 @@ async def lifespan(app: FastAPI):
 app = FastAPI(title="todoist-agent ingress", lifespan=lifespan)
 
 
-def _event_key(body: bytes) -> str:
-    # Content-hash deduplication — same payload = same key regardless of delivery attempt
-    return hashlib.sha256(body).hexdigest()
-
-
 @app.post("/webhook/todoist")
 async def todoist_webhook(request: Request) -> Response:
-    body = await verify_todoist_signature(request)
+    body, delivery_id = await verify_todoist_signature(request)
 
-    if await is_duplicate(_event_key(body)):
-        logger.info("Duplicate webhook delivery, skipping")
+    if await is_duplicate(delivery_id):
+        logger.info("Duplicate delivery %s, skipping", delivery_id)
         return Response(status_code=200)
 
     payload = json.loads(body)
